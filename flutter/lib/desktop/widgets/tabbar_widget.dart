@@ -432,7 +432,15 @@ class _DesktopTabState extends State<DesktopTab>
 
   @override
   void onWindowClose() async {
-    mainWindowClose() async => await windowManager.hide();
+    // On Linux the GtkWindow can already be destroyed here, and hiding it then
+    // raises GTK CRITICAL assertions on the way to a SIGSEGV.
+    mainWindowClose() async {
+      try {
+        await windowManager.hide();
+      } catch (e) {
+        debugPrint('Failed to hide window (may already be closing): $e');
+      }
+    }
     notMainWindowClose(WindowController windowController) async {
       if (controller.length != 0) {
         debugPrint("close not empty multiwindow from taskbar");
