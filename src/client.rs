@@ -3272,10 +3272,10 @@ lazy_static::lazy_static! {
     static ref LOGIN_ERROR_MAP: Arc<HashMap<&'static str, LoginErrorMsgBox>> = {
         use config::LINK_HEADLESS_LINUX_SUPPORT;
         let map = HashMap::from([(LOGIN_SCREEN_WAYLAND, LoginErrorMsgBox{
-            msgtype: "error",
-            title: "Login Error",
-            text: "Login screen using Wayland is not supported",
-            link: "https://rustdesk.com/docs/en/manual/linux/#login-screen",
+            msgtype: "session-login-password",
+            title: "",
+            text: "",
+            link: "",
             try_again: true,
         }), (LOGIN_MSG_DESKTOP_SESSION_NOT_READY, LoginErrorMsgBox{
             msgtype: "session-login",

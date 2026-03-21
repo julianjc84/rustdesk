@@ -96,6 +96,28 @@ fn detect_headless() -> Option<&'static str> {
 
 pub fn try_start_desktop(_username: &str, _passsword: &str) -> String {
     debug_assert!(crate::is_server());
+
+    // If we're at a Wayland login screen and have credentials, start a Wayland session
+    if is_login_screen_wayland() {
+        if _username.is_empty() {
+            return LOGIN_MSG_DESKTOP_SESSION_NOT_READY.to_owned();
+        }
+        log::info!("try_start_desktop: Wayland login screen, attempting session for '{}'", _username);
+        return match try_start_wayland_session(_username, _passsword) {
+            Ok(session_ready) => {
+                if session_ready {
+                    "".to_owned()
+                } else {
+                    LOGIN_MSG_DESKTOP_SESSION_NOT_READY.to_owned()
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to start Wayland session: {}", e);
+                LOGIN_MSG_DESKTOP_XSESSION_FAILED.to_owned()
+            }
+        };
+    }
+
     if _username.is_empty() {
         let username = get_username();
         if username.is_empty() {
@@ -732,6 +754,200 @@ impl DesktopManager {
             log::warn!("xdesktop child is still running!");
         }
     }
+}
+
+/// Attempt to start a Wayland desktop session for the given user via PAM + loginctl/systemd.
+///
+/// Returns Ok(true) if a desktop session is already active for the user,
+/// Ok(false) if session start was initiated but not yet ready (client should retry).
+pub fn debug_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/rustdesk_debug.log") {
+        let _ = writeln!(f, "{:?} {}", std::time::SystemTime::now(), msg);
+    }
+}
+
+fn try_start_wayland_session(username: &str, password: &str) -> ResultType<bool> {
+    debug_log(&format!("try_start_wayland_session: user='{}', password_len={}", username, password.len()));
+
+    let userinfo = match get_user_by_name(username) {
+        Some(u) => {
+            debug_log(&format!("try_start_wayland_session: found user uid={}", u.uid()));
+            u
+        }
+        None => {
+            debug_log(&format!("try_start_wayland_session: user '{}' NOT FOUND", username));
+            bail!("User '{}' not found", username);
+        }
+    };
+
+    // PAM authenticate — use 'login' service which is always available
+    let pam_service = if Path::new("/etc/pam.d/login").is_file() {
+        "login".to_owned()
+    } else {
+        pam_get_service_name()
+    };
+    debug_log(&format!("try_start_wayland_session: PAM service='{}', authenticating...", pam_service));
+    let mut client = pam::Client::with_password(&pam_service)?;
+    client
+        .conversation_mut()
+        .set_credentials(username, password);
+    match client.authenticate() {
+        Ok(_) => debug_log("try_start_wayland_session: PAM authenticate OK"),
+        Err(ref e) => {
+            debug_log(&format!("try_start_wayland_session: PAM authenticate FAILED: {}", e));
+            bail!("PAM authentication failed for '{}': {}", username, e);
+        }
+    }
+    // Skip pam_open_session() — it creates a lingering logind session we don't need.
+    // The real session is created by the display manager when it restarts with autologin.
+
+    // PAM succeeded. Write a signal file so the service daemon (start_os_service loop)
+    // can handle session activation — but only if one isn't already pending.
+    let signal_path = wayland_session_signal_path();
+    if Path::new(&signal_path).exists() {
+        debug_log("try_start_wayland_session: signal file already exists — activation in progress, skipping");
+        return Ok(false);
+    }
+
+    let session_exec = get_user_session_exec(username);
+    let signal_content = format!("{}\n{}\n{}", username, userinfo.uid(), session_exec);
+    debug_log(&format!("try_start_wayland_session: writing signal file to {} (session_exec='{}')", signal_path, session_exec));
+
+    if let Err(e) = std::fs::write(&signal_path, &signal_content) {
+        debug_log(&format!("try_start_wayland_session: failed to write signal file: {}", e));
+        bail!("Failed to write session signal file: {}", e);
+    }
+
+    debug_log("try_start_wayland_session: signal file written, returning Ok(false) — service loop will activate session");
+    Ok(false)
+}
+
+/// Determine the session executable for a user's preferred Wayland session.
+///
+/// Checks (in order):
+/// 1. AccountsService user config (`/var/lib/AccountsService/users/$USER`)
+/// 2. Available `.desktop` files in `/usr/share/wayland-sessions/`
+/// 3. Fallback to `gnome-session` (most common)
+fn get_user_session_exec(username: &str) -> String {
+    // Try AccountsService
+    let accounts_file = format!("/var/lib/AccountsService/users/{}", username);
+    if let Ok(contents) = std::fs::read_to_string(&accounts_file) {
+        // Look for Session= or XSession= key
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.starts_with("Session=") || line.starts_with("XSession=") {
+                if let Some(session_name) = line.split('=').nth(1) {
+                    let session_name = session_name.trim();
+                    if !session_name.is_empty() {
+                        if let Some(exec) = resolve_wayland_session_exec(session_name) {
+                            return exec;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Scan /usr/share/wayland-sessions/ for any available session
+    if let Ok(entries) = std::fs::read_dir("/usr/share/wayland-sessions") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "desktop") {
+                if let Some(exec) = parse_desktop_exec(&path) {
+                    return exec;
+                }
+            }
+        }
+    }
+
+    // Fallback
+    log::warn!("No Wayland session found, falling back to gnome-session");
+    "gnome-session".to_owned()
+}
+
+/// Look up a session name in wayland-sessions .desktop files and return its Exec= line.
+fn resolve_wayland_session_exec(session_name: &str) -> Option<String> {
+    let desktop_file = format!(
+        "/usr/share/wayland-sessions/{}.desktop",
+        session_name
+    );
+    if Path::new(&desktop_file).is_file() {
+        return parse_desktop_exec(Path::new(&desktop_file));
+    }
+    None
+}
+
+/// Parse the Exec= line from a .desktop file.
+fn parse_desktop_exec(path: &Path) -> Option<String> {
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.starts_with("Exec=") {
+                let exec = line.strip_prefix("Exec=").unwrap_or("").trim();
+                if !exec.is_empty() {
+                    return Some(exec.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Path for the session activation signal file.
+/// Written by the connection handler, read by start_os_service() loop.
+pub fn wayland_session_signal_path() -> String {
+    "/tmp/rustdesk-wayland-session-request".to_owned()
+}
+
+/// Read and parse the session activation signal file.
+/// Returns Some((username, uid, session_exec)) if a request is pending.
+pub fn read_wayland_session_signal() -> Option<(String, u32, String)> {
+    let path = wayland_session_signal_path();
+    if !Path::new(&path).exists() {
+        return None;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let lines: Vec<&str> = contents.trim().lines().collect();
+            if lines.len() >= 3 {
+                let username = lines[0].to_string();
+                let uid: u32 = lines[1].parse().unwrap_or(0);
+                let session_exec = lines[2].to_string();
+                if !username.is_empty() && uid > 0 && !session_exec.is_empty() {
+                    return Some((username, uid, session_exec));
+                }
+            }
+            // Malformed signal file — remove it
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// Remove the session activation signal file.
+pub fn clear_wayland_session_signal() {
+    let _ = std::fs::remove_file(&wayland_session_signal_path());
+}
+
+/// Detect which display manager systemd service is running.
+/// Returns None if no known DM is detected — caller should not proceed with activation.
+pub fn detect_display_manager_service() -> Option<String> {
+    for dm in &["gdm", "gdm3", "sddm", "lightdm", "lxdm", "xdm"] {
+        if let Ok(output) = run_cmds(&format!("systemctl is-active {}", dm)) {
+            if output.trim() == "active" {
+                return Some(dm.to_string());
+            }
+        }
+    }
+    // Fallback: check display-manager.service alias
+    if let Ok(output) = run_cmds("systemctl is-active display-manager") {
+        if output.trim() == "active" {
+            return Some("display-manager".to_string());
+        }
+    }
+    None
 }
 
 fn pam_get_service_name() -> String {
