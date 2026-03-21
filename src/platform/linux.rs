@@ -694,6 +694,182 @@ fn force_stop_server() {
     sleep_millis(super::SERVICE_INTERVAL);
 }
 
+/// Get the autologin config path, content, and backup path for the detected display manager.
+/// Returns None if the DM is not supported.
+fn get_dm_autologin_config(dm_service: &str, username: &str) -> Option<(String, String, String)> {
+    match dm_service {
+        // GDM (GNOME) — Arch, Fedora, Ubuntu (gdm3)
+        "gdm" | "gdm3" => {
+            let conf_path = if Path::new("/etc/gdm/custom.conf").exists()
+                || Path::new("/etc/gdm/").is_dir()
+            {
+                "/etc/gdm/custom.conf"
+            } else if Path::new("/etc/gdm3/custom.conf").exists()
+                || Path::new("/etc/gdm3/").is_dir()
+            {
+                "/etc/gdm3/custom.conf"
+            } else {
+                return None;
+            };
+            let content = format!(
+                "[daemon]\nAutomaticLoginEnable=true\nAutomaticLogin={}\n",
+                username
+            );
+            let backup = format!("{}.rustdesk-backup", conf_path);
+            Some((conf_path.to_owned(), content, backup))
+        }
+        // SDDM (KDE) — Arch, Fedora KDE, openSUSE
+        "sddm" => {
+            // Use a drop-in config file so we don't clobber the main sddm.conf
+            let conf_dir = "/etc/sddm.conf.d";
+            let _ = std::fs::create_dir_all(conf_dir);
+            let conf_path = format!("{}/rustdesk-autologin.conf", conf_dir);
+            let content = format!(
+                "[Autologin]\nUser={}\nSession=\n",
+                username
+            );
+            // No backup needed — we create a new drop-in file and delete it after
+            let backup = format!("{}.rustdesk-backup", conf_path);
+            Some((conf_path, content, backup))
+        }
+        // LightDM — Ubuntu (older), Linux Mint, many distros
+        "lightdm" => {
+            let conf_path = "/etc/lightdm/lightdm.conf";
+            let content = format!(
+                "[Seat:*]\nautologin-user={}\n",
+                username
+            );
+            let backup = format!("{}.rustdesk-backup", conf_path);
+            Some((conf_path.to_owned(), content, backup))
+        }
+        _ => None,
+    }
+}
+
+/// Restore the DM config from backup, or clean up the autologin file.
+fn restore_dm_config(conf_path: &str, backup_path: &str, dm_service: &str) {
+    if Path::new(backup_path).exists() {
+        let _ = std::fs::copy(backup_path, conf_path);
+        let _ = std::fs::remove_file(backup_path);
+        super::linux_desktop_manager::debug_log(&format!(
+            "activate_wayland_session: restored original {} config", dm_service
+        ));
+    } else if dm_service == "sddm" {
+        // SDDM uses a drop-in file — just delete it
+        let _ = std::fs::remove_file(conf_path);
+        super::linux_desktop_manager::debug_log(
+            "activate_wayland_session: removed SDDM autologin drop-in"
+        );
+    } else {
+        // No backup existed — write a minimal empty config
+        let default = match dm_service {
+            "gdm" | "gdm3" => "[daemon]\n",
+            "lightdm" => "[Seat:*]\n",
+            _ => "",
+        };
+        let _ = std::fs::write(conf_path, default);
+        super::linux_desktop_manager::debug_log(&format!(
+            "activate_wayland_session: reset {} config (no original existed)", dm_service
+        ));
+    }
+}
+
+/// Activate a Wayland session by temporarily enabling DM autologin and restarting
+/// the display manager. Called from start_os_service() loop only — the service
+/// daemon survives DM restarts, unlike --server subprocesses.
+fn activate_wayland_session(username: &str, _uid: u32, _session_exec: &str) {
+    super::linux_desktop_manager::debug_log(&format!(
+        "activate_wayland_session: starting for user='{}'", username
+    ));
+
+    // Detect the display manager BEFORE modifying anything
+    let dm_service = match super::linux_desktop_manager::detect_display_manager_service() {
+        Some(dm) => dm,
+        None => {
+            log::error!("activate_wayland_session: no display manager detected, aborting");
+            super::linux_desktop_manager::debug_log(
+                "activate_wayland_session: no known DM detected — refusing to proceed"
+            );
+            return;
+        }
+    };
+    super::linux_desktop_manager::debug_log(&format!(
+        "activate_wayland_session: detected DM '{}'", dm_service
+    ));
+
+    // Get the autologin config for this DM
+    let (conf_path, autologin_content, backup_path) =
+        match get_dm_autologin_config(&dm_service, username) {
+            Some(config) => config,
+            None => {
+                super::linux_desktop_manager::debug_log(&format!(
+                    "activate_wayland_session: DM '{}' not supported for autologin", dm_service
+                ));
+                return;
+            }
+        };
+
+    // Step 1: Back up existing config
+    if Path::new(&conf_path).exists() {
+        let _ = std::fs::copy(&conf_path, &backup_path);
+        super::linux_desktop_manager::debug_log(&format!(
+            "activate_wayland_session: backed up {} to {}", conf_path, backup_path
+        ));
+    }
+
+    // Step 2: Write temporary autologin config
+    if let Err(e) = std::fs::write(&conf_path, &autologin_content) {
+        super::linux_desktop_manager::debug_log(&format!(
+            "activate_wayland_session: failed to write autologin config: {}", e
+        ));
+        return;
+    }
+    super::linux_desktop_manager::debug_log(&format!(
+        "activate_wayland_session: autologin config written to {}", conf_path
+    ));
+
+    // Step 3: Restart the DM — it will read autologin and log the user in
+    // with full systemd user infrastructure (D-Bus, portals, etc.)
+    super::linux_desktop_manager::debug_log(&format!(
+        "activate_wayland_session: restarting {} with autologin", dm_service
+    ));
+    if let Err(e) = run_cmds(&format!("systemctl restart {}", dm_service)) {
+        log::error!("activate_wayland_session: failed to restart {}: {:?}", dm_service, e);
+        restore_dm_config(&conf_path, &backup_path, &dm_service);
+        return;
+    }
+    super::linux_desktop_manager::debug_log("activate_wayland_session: DM restart issued");
+
+    // Step 4: Restore original config after a delay so autologin doesn't persist.
+    // 10 seconds is enough for the DM to read the config and start the session.
+    let conf = conf_path.clone();
+    let backup = backup_path.clone();
+    let dm_svc = dm_service.clone();
+    std::thread::spawn(move || {
+        sleep_millis(10_000);
+        restore_dm_config(&conf, &backup, &dm_svc);
+    });
+
+    // Safety net: if no user session appears within 45s, log a warning.
+    // The DM is already running so no restart needed.
+    let expected_user = username.to_string();
+    std::thread::spawn(move || {
+        sleep_millis(45_000);
+        let seat0_values = get_values_of_seat0(&[0, 2]);
+        if is_gdm_user(&seat0_values[1]) || seat0_values[1].is_empty() {
+            super::linux_desktop_manager::debug_log(&format!(
+                "activate_wayland_session: SAFETY WARNING — user '{}' not on seat0 after 45s (found '{}'). Autologin may have failed.",
+                expected_user, seat0_values[1]
+            ));
+        } else {
+            super::linux_desktop_manager::debug_log(&format!(
+                "activate_wayland_session: safety check OK — '{}' is on seat0",
+                seat0_values[1]
+            ));
+        }
+    });
+}
+
 pub fn start_os_service() {
     check_if_stop_service();
     stop_rustdesk_servers();
@@ -712,6 +888,7 @@ pub fn start_os_service() {
     let mut uid = "".to_owned();
     let mut server: Option<Child> = None;
     let mut user_server: Option<Child> = None;
+    let mut wayland_activation_in_progress = false;
     if let Err(err) = ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
     }) {
@@ -725,7 +902,38 @@ pub fn start_os_service() {
 
         // Duplicate logic here with should_start_server
         // Login wayland will try to start a headless --server.
-        if desktop.username == "root" || desktop.is_login_wayland() {
+        // Also handle DM greeter users (sddm, gdm, lightdm) — don't spawn
+        // a --server for them, it creates a stale --cm that spins CPU.
+        if desktop.username == "root" || is_gdm_user(&desktop.username) || desktop.is_login_wayland() {
+            // Check if a PAM-authenticated session activation request is pending.
+            // The connection handler writes a signal file after PAM auth succeeds;
+            // we handle the DM stop + compositor launch here in the service daemon
+            // because we survive DM restarts (the --server subprocess doesn't).
+            if desktop.is_login_wayland() && !wayland_activation_in_progress {
+                if let Some((req_user, req_uid, req_exec)) =
+                    super::linux_desktop_manager::read_wayland_session_signal()
+                {
+                    log::info!(
+                        "Wayland session activation: user='{}' uid={} exec='{}'",
+                        req_user, req_uid, req_exec
+                    );
+                    super::linux_desktop_manager::clear_wayland_session_signal();
+                    wayland_activation_in_progress = true;
+
+                    // Stop all existing servers before DM transition
+                    stop_server(&mut user_server);
+                    stop_server(&mut server);
+                    force_stop_server();
+
+                    activate_wayland_session(&req_user, req_uid, &req_exec);
+
+                    // After activation, give the compositor time to start.
+                    // The next loop iteration will detect the new session.
+                    sleep_millis(3000);
+                    continue;
+                }
+            }
+
             // try kill subprocess "--server"
             stop_server(&mut user_server);
             // try start subprocess "--server"
@@ -744,6 +952,13 @@ pub fn start_os_service() {
                 start_server(None, &mut server);
             }
         } else if desktop.username != "" {
+            // User session is active — clear activation flag
+            if wayland_activation_in_progress {
+                wayland_activation_in_progress = false;
+                super::linux_desktop_manager::debug_log(
+                    "start_os_service: wayland activation complete — user session detected"
+                );
+            }
             // try kill subprocess "--server"
             stop_server(&mut server);
 

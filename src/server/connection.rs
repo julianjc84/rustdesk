@@ -1574,26 +1574,23 @@ impl Connection {
         }
         #[cfg(target_os = "linux")]
         if self.is_remote() {
-            let mut msg = "".to_string();
-            if crate::platform::linux::is_login_screen_wayland() {
-                msg = crate::client::LOGIN_SCREEN_WAYLAND.to_owned()
-            } else {
+            // Wayland login screens are handled by the headless login flow
+            // (PAM auth + session start) instead of being rejected.
+            if !crate::platform::linux::is_login_screen_wayland() {
                 let dtype = crate::platform::linux::get_display_server();
                 if dtype != crate::platform::linux::DISPLAY_SERVER_X11
                     && dtype != crate::platform::linux::DISPLAY_SERVER_WAYLAND
                 {
-                    msg = format!(
+                    let msg = format!(
                         "Unsupported display server type \"{}\", x11 or wayland expected",
                         dtype
                     );
+                    res.set_error(msg);
+                    let mut msg_out = Message::new();
+                    msg_out.set_login_response(res);
+                    self.send(msg_out).await;
+                    return true;
                 }
-            }
-            if !msg.is_empty() {
-                res.set_error(msg);
-                let mut msg_out = Message::new();
-                msg_out.set_login_response(res);
-                self.send(msg_out).await;
-                return true;
             }
         }
         #[allow(unused_mut)]
@@ -5298,8 +5295,13 @@ struct LinuxHeadlessHandle {
 #[cfg(target_os = "linux")]
 impl LinuxHeadlessHandle {
     pub fn new(rx_cm_stream_ready: mpsc::Receiver<()>, tx_desktop_ready: mpsc::Sender<()>) -> Self {
-        let is_headless_allowed = crate::is_server() && crate::platform::is_headless_allowed();
-        let is_headless = is_headless_allowed && linux_desktop_manager::is_headless();
+        let is_server = crate::is_server();
+        let headless_allowed_setting = crate::platform::is_headless_allowed();
+        let wayland_login = crate::platform::linux::is_login_screen_wayland();
+        let is_headless_allowed = is_server
+            && (headless_allowed_setting || wayland_login);
+        let dm_headless = if is_headless_allowed { linux_desktop_manager::is_headless() } else { false };
+        let is_headless = is_headless_allowed && (dm_headless || wayland_login);
         Self {
             is_headless_allowed,
             is_headless,
