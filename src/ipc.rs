@@ -428,6 +428,38 @@ pub async fn start(postfix: &str) -> ResultType<()> {
 
 pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     let path = Config::ipc_path(postfix);
+    // hbb_common's `ipc_path()` is intentionally side-effect free on Linux/macOS
+    // and expects the IPC server boundary to mkdir + chmod the parent directory.
+    // Without this, `bind()` returns ENOENT for `/tmp/RustDesk-service/...` and
+    // `/tmp/RustDesk-{uid}/...` on a fresh system.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                log::warn!(
+                    "Failed to create ipc parent dir {}: {}",
+                    parent.display(),
+                    err
+                );
+            }
+            let mode = if config::is_service_ipc_postfix(postfix) {
+                0o0711
+            } else {
+                0o0700
+            };
+            if let Err(err) =
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode))
+            {
+                log::warn!(
+                    "Failed to chmod ipc parent dir {} to {:o}: {}",
+                    parent.display(),
+                    mode,
+                    err
+                );
+            }
+        }
+    }
     #[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
     check_pid(postfix).await;
     let mut endpoint = Endpoint::new(path.clone());
