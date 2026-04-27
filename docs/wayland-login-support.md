@@ -101,10 +101,12 @@ autologin-user=username
 |------|--------|
 | `src/server/connection.rs` | Remove Wayland login rejection; allow headless handle for Wayland login screens |
 | `src/platform/linux_desktop_manager.rs` | PAM authentication, signal file read/write, session exec resolution, DM detection, autologin config helpers |
-| `src/platform/linux.rs` | `activate_wayland_session()` — DM autologin + restart; service loop signal handling; skip server spawn for DM greeter users |
+| `src/platform/linux.rs` | `activate_wayland_session()` — DM autologin + restart; service loop signal handling; skip server spawn for DM greeter users; `Desktop::refresh()` seat0-ownership pre-check (prevents stale cache from spawning a `--server` under the just-logged-out user when the greeter takes over seat0) |
 | `src/client.rs` | Map `LOGIN_SCREEN_WAYLAND` error to `session-login-password` dialog |
-| `libs/hbb_common/src/platform/linux.rs` | Add `gdm-greeter` and `lightdm` to `is_gdm_user()` |
-| `CLAUDE.md` | GCC 15+ build workaround note |
+
+**Depends on (in base branch `julian/stacked-linux-fixes`):**
+- `libs/hbb_common/src/platform/linux.rs` — `is_gdm_user()` adds `gdm-greeter` (wayland-greeter user on Arch GDM 50+, required for this feature) and `lightdm` (fixes a separate pre-existing typo, useful on both X11 and Wayland). Bundled in one submodule fork commit.
+- `src/ipc.rs` — IPC parent dir creation (per-uid IPC sockets, independent fix)
 
 ## Known Issues
 
@@ -114,9 +116,15 @@ autologin-user=username
 
 3. **Session selection**: The PAM login dialog only has username + password fields. The user cannot choose which desktop session to launch — it uses the last-selected session from AccountsService. Future work: add a session dropdown to the Flutter dialog.
 
-4. **GDM-specific autologin**: Only GDM autologin has been tested. SDDM and LightDM autologin configs are implemented but untested (these DMs currently use X11 greeters where direct capture works).
+4. **Autologin tested on GDM only**: GDM autologin is verified working on Arch (GDM 50.0-2, GNOME Shell 50.1). SDDM and LightDM autologin configs are implemented but untested — these DMs currently use X11 greeters where direct capture works, so the wayland flow rarely fires.
 
 5. **Non-systemd distros**: The implementation relies on `systemctl` for DM management and `loginctl`/logind for session detection. Non-systemd distros (Void, Artix, Gentoo OpenRC) are not supported.
+
+6. **Brief stale-user spawn during seat0 transition**: For ~3 seconds after a user logs out, the daemon may spawn one `--server` under the logged-out user before `Desktop::refresh()` re-queries seat0 and notices the greeter has taken over. Recovers automatically. The seat0-ownership pre-check in `refresh()` reduced this from ~51 seconds (persistent stuck state) to ~3 seconds (transient).
+
+7. **Lingering logind sessions from PAM**: `pam_open_session()` may create logind sessions that aren't cleaned up after the connection handler exits. Doesn't break the flow but contributes to session accounting noise. Future work: skip `open_session` or call `pam_close_session()` explicitly.
+
+8. **PAM service name (Arch)**: On Arch, `/etc/pam.d/gdm` doesn't exist — the implementation falls back to the `login` PAM service, which works because Arch's `login` stack accepts password auth for any user. Distros without either service are not supported.
 
 ## Testing
 
