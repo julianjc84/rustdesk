@@ -2030,6 +2030,24 @@ mod desktop {
         }
 
         pub fn refresh(&mut self) {
+            // Verify cached seat0 ownership before trusting the fast-path.
+            // Without this, after a user logs out and the greeter takes over,
+            // is_active_and_seat0(&self.sid) may briefly still return true
+            // (closing-state window) AND the subsequent get_display_xauth_wayland()
+            // blocks ~3 seconds waiting for the dying session's wayland procs —
+            // so refresh returns with a stale cached username (e.g. "julian")
+            // even though gdm-greeter is now the seat0 owner. The daemon then
+            // spawns `--server` under the logged-out user, which can't open a
+            // display and never reaches the gdm-greeter / Wayland-login PAM path.
+            if !self.sid.is_empty() {
+                let current = get_values_of_seat0_with_gdm_wayland(&[0, 2]);
+                if current[0] != self.sid || current[1] != self.username {
+                    // Seat0 user changed — drop cached state and rebuild below.
+                    *self = Self::default();
+                    self.is_rustdesk_subprocess = false;
+                }
+            }
+
             if !self.sid.is_empty() && is_active_and_seat0(&self.sid) {
                 // Xwayland display and xauth may not be available in a short time after login.
                 if is_xwayland_running() && !self.is_login_wayland() {
