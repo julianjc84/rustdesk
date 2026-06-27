@@ -53,7 +53,8 @@ dependencies:
   flutter_rust_bridge: "1.80.1"
   window_manager:
     git:
-      url: https://github.com/rustdesk-org/window_manager
+      url: https://github.com/julianjc84/window_manager
+      ref: fix/linux-nullptr-guards-sigsegv
   desktop_multi_window:
     git:
       url: https://github.com/rustdesk-org/rustdesk_desktop_multi_window
