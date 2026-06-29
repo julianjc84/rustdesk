@@ -1634,7 +1634,7 @@ packages:
     description:
       path: "."
       ref: "fix/linux-nullptr-guards-sigsegv"
-      resolved-ref: "9612eb23d822829967eda72ee5cb66f39bc9f84a"
+      resolved-ref: "2690030383fe5e26986f081d974178872cfd2428"
       url: "https://github.com/julianjc84/window_manager"
     source: git
     version: "0.3.6"
